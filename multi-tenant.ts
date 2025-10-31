@@ -100,7 +100,7 @@ async function fetchFromDynatrace(credentialId, url, query) {
   return res.json();
 }
 
-// ----------------- merger: dynamic types + tenant -----------------
+// ----------------- merger: dynamic types + tenant (with totals) -----------------
 function mergeMultiTenant(responses /* [{tenant, json}] */) {
   if (!responses.length) return { records: [], types: [], metadata: {}, metrics: [] };
 
@@ -120,48 +120,82 @@ function mergeMultiTenant(responses /* [{tenant, json}] */) {
     types0 = deepClone(baseTypes0);
     types0.mappings = types0.mappings || {};
   } else {
-    types0 = inferTypesFromRecord(allRecords[0])?.[0];
+    const inferred = inferTypesFromRecord(allRecords[0]) || [];
+    types0 = inferred[0];
   }
-  // Add tenant mapping only if missing
   if (!types0.mappings.tenant) types0.mappings.tenant = { type: "string" };
   const types = [types0];
 
-  // Metadata: widen timeframe and sum scannedDataPoints across tenants
+  // ---- Totals & per-tenant breakdowns ----
   const baseMeta = normalized[0].metadata || {};
-  const scannedSum = normalized.reduce(
-    (acc, n) => acc + Number(n.metadata?.grail?.scannedDataPoints || 0),
-    0
-  );
-  const metadata = globalTimeframe(allRecords, {
-    ...baseMeta,
-    grail: {
-      ...(baseMeta.grail ?? {}),
-      scannedDataPoints: scannedSum || baseMeta.grail?.scannedDataPoints,
-    },
+  const baseGrail = baseMeta.grail || {};
+
+  const totals = { scannedRecords: 0, scannedBytes: 0, scannedDataPoints: 0, executionTimeMilliseconds: 0 };
+  const perTenant = {};
+
+  normalized.forEach((n) => {
+    const g = n.metadata?.grail || {};
+    const t = n.tenant;
+    const sr  = Number(g.scannedRecords || 0);
+    const sb  = Number(g.scannedBytes || 0);
+    const sdp = Number(g.scannedDataPoints || 0);
+    const etm = Number(n.metadata?.executionTimeMilliseconds || g.executionTimeMilliseconds || 0);
+
+    totals.scannedRecords            += sr;
+    totals.scannedBytes              += sb;
+    totals.scannedDataPoints         += sdp;
+    totals.executionTimeMilliseconds += etm;
+
+    perTenant[`scannedRecords-${t}`]            = sr;
+    perTenant[`scannedBytes-${t}`]              = sb;
+    perTenant[`scannedDataPoints-${t}`]         = sdp;
+    perTenant[`executionTimeMilliseconds-${t}`] = etm;
   });
 
-  // Keep metrics from first response
+  // Widen timeframe (min start / max end across all records)
+  const widened = globalTimeframe(allRecords, baseMeta);
+
+  // Prefer the first non-"Z" timezone if any tenant provides one
+  const tzCandidate = normalized
+    .map((n) => n.metadata?.grail?.timezone)
+    .find((z) => z && z !== "Z");
+
+  const metadata = {
+    ...widened,
+    grail: {
+      ...(widened.grail || {}),
+      timezone: tzCandidate || baseGrail.timezone || "Z",
+      scannedRecords:     totals.scannedRecords,
+      scannedBytes:       totals.scannedBytes,
+      scannedDataPoints:  totals.scannedDataPoints,
+      // per-tenant breakdowns merged below
+    },
+    // Keep total execution time at the top level (mirrors API field)
+    executionTimeMilliseconds: totals.executionTimeMilliseconds,
+  };
+  metadata.grail = { ...(metadata.grail || {}), ...perTenant };
+
+  // Keep metrics from first response (identical for same query)
   const metrics = normalized[0].metrics;
 
-  // Cosmetic: reflect tenant in query/by if present
+  // Cosmetic: ensure tenant appears in BY clause text if those strings exist
   if (metadata?.grail) {
     const addTenantToBy = (txt) =>
       typeof txt === "string"
-        ? txt.replace(/by:\s*\{\s*([^}]*)\s*\}/i, (_, g1) => {
-            const parts = g1
-              .split(",")
-              .map((s) => s.trim())
-              .filter(Boolean);
+        ? txt.replace(/by:\s*\{\s*([^}]*)\s*\}/i, (_m, g1) => {
+            const parts = g1.split(",").map((s) => s.trim()).filter(Boolean);
             if (!parts.includes("tenant")) parts.push("tenant");
             return `by:{${parts.join(", ")}}`;
           })
         : txt;
     metadata.grail.canonicalQuery = addTenantToBy(metadata.grail.canonicalQuery);
-    metadata.grail.query = addTenantToBy(metadata.grail.query);
+    metadata.grail.query          = addTenantToBy(metadata.grail.query);
   }
 
+  // Return exactly the expected top-level keys; no duplicates
   return { records: allRecords, types, metadata, metrics };
 }
+
 
 // ----------------- main entry -----------------
 export default async function () {
