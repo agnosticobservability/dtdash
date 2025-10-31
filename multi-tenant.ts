@@ -5,6 +5,7 @@ import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment
  * Multi-tenant DQL executor & merger (dynamic types + tenant + metadata totals)
  */
 
+// ---------- utils ----------
 const asArray = (v) => (Array.isArray(v) ? v : v ? [v] : []);
 const deepClone = (obj) => JSON.parse(JSON.stringify(obj));
 const parseTs = (s) => (typeof s === "string" ? Date.parse(s) : Number(s));
@@ -41,7 +42,7 @@ const globalTimeframe = (records, baseMeta) => {
   };
 };
 
-// Fallback: infer minimal types[0] from one record if API didn't return types
+// Fallback: infer minimal types[0] from one record if API didn’t return types
 function inferTypesFromRecord(sample) {
   const mappings = {};
   for (const [k, v] of Object.entries(sample ?? {})) {
@@ -67,15 +68,18 @@ function inferTypesFromRecord(sample) {
   return [{ indexRange: [0, 1], mappings }];
 }
 
+// ---------- network ----------
 async function fetchFromDynatrace(credentialId, url, query) {
   if (!credentialId || !url || !query) throw new Error("Missing credentialId, url, or query.");
 
+  console.log("[Fetch] URL:", url);
   const token = await credentialVaultClient
     .getCredentialsDetails({ id: credentialId })
     .then((r) => r?.token);
   if (!token) throw new Error("Empty platform token.");
 
   const body = { query, requestTimeoutMilliseconds: 60000, enablePreview: true };
+  console.log("[Fetch] Body:", body);
 
   const res = await fetch(url, {
     method: "POST",
@@ -86,24 +90,31 @@ async function fetchFromDynatrace(credentialId, url, query) {
     },
     body: JSON.stringify(body),
   });
+
+  console.log("[Fetch] Status:", res.status, res.statusText);
   if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
-  return res.json();
+
+  const json = await res.json();
+  console.log("[Fetch] Keys:", Object.keys(json || {}));
+  return json;
 }
 
-/** MERGER: dynamic types + tenant + metadata totals + timezone fix */
+// ---------- merger: dynamic types + tenant + totals + TZ fix ----------
 function mergeMultiTenant(responses /* [{tenant, json}] */) {
   if (!responses.length) return { records: [], types: [], metadata: {}, metrics: [] };
 
-  // Normalize and inject tenant column per record
+  // Normalize & inject tenant
   const normalized = responses.map(({ tenant, json }) => {
     const n = normalize(json);
     const withTenant = n.records.map((r) => ({ ...r, tenant }));
+    console.log(`[Merge] ${tenant}: recs=${withTenant.length}, types=${n.types?.length || 0}`);
     return { tenant, records: withTenant, types: n.types, metadata: n.metadata, metrics: n.metrics };
   });
 
   const allRecords = normalized.flatMap((n) => n.records);
+  console.log("[Merge] Total merged records:", allRecords.length);
 
-  // Build types dynamically from first response (or infer)
+  // Dynamic types (clone first tenant’s types, or infer)
   let types0;
   const baseTypes0 = normalized[0].types?.[0];
   if (baseTypes0) {
@@ -116,16 +127,16 @@ function mergeMultiTenant(responses /* [{tenant, json}] */) {
   if (!types0.mappings.tenant) types0.mappings.tenant = { type: "string" };
   const types = [types0];
 
-  // ---- Totals & per-tenant breakdowns ----
-  const baseMeta = normalized[0].metadata || {};
+  // Totals & per-tenant breakdowns
+  const baseMeta  = normalized[0].metadata || {};
   const baseGrail = baseMeta.grail || {};
 
   const totals = { scannedRecords: 0, scannedBytes: 0, scannedDataPoints: 0, executionTimeMilliseconds: 0 };
   const perTenant = {};
 
   normalized.forEach((n) => {
-    const g = n.metadata?.grail || {};
-    const t = n.tenant;
+    const g   = n.metadata?.grail || {};
+    const tag = n.tenant;
     const sr  = Number(g.scannedRecords || 0);
     const sb  = Number(g.scannedBytes || 0);
     const sdp = Number(g.scannedDataPoints || 0);
@@ -136,13 +147,13 @@ function mergeMultiTenant(responses /* [{tenant, json}] */) {
     totals.scannedDataPoints         += sdp;
     totals.executionTimeMilliseconds += etm;
 
-    perTenant[`scannedRecords-${t}`]            = sr;
-    perTenant[`scannedBytes-${t}`]              = sb;
-    perTenant[`scannedDataPoints-${t}`]         = sdp;
-    perTenant[`executionTimeMilliseconds-${t}`] = etm;
+    perTenant[`scannedRecords-${tag}`]            = sr;
+    perTenant[`scannedBytes-${tag}`]              = sb;
+    perTenant[`scannedDataPoints-${tag}`]         = sdp;
+    perTenant[`executionTimeMilliseconds-${tag}`] = etm;
   });
 
-  // Widen timeframe and fix timezone
+  // Global timeframe & timezone
   const widened = globalTimeframe(allRecords, baseMeta);
   const tzCandidate = normalized.map((n) => n.metadata?.grail?.timezone).find((z) => z && z !== "Z");
 
@@ -154,17 +165,16 @@ function mergeMultiTenant(responses /* [{tenant, json}] */) {
       scannedRecords:    totals.scannedRecords,
       scannedBytes:      totals.scannedBytes,
       scannedDataPoints: totals.scannedDataPoints,
-      // per-tenant breakdowns merged below
+      ...perTenant, // per-tenant breakdowns here
     },
-    // Keep the total execution time at the top level (to match API placement)
+    // keep total execution time at top-level (matches Dynatrace schema)
     executionTimeMilliseconds: totals.executionTimeMilliseconds,
   };
-  metadata.grail = { ...(metadata.grail || {}), ...perTenant };
 
-  // Keep ONLY one top-level metrics array (from first response)
+  // Exactly one top-level metrics array (use first response)
   const metrics = normalized[0].metrics;
 
-  // Ensure BY clause text includes tenant if present
+  // Ensure BY clause text reflects tenant (if present)
   if (metadata?.grail) {
     const addTenantToBy = (txt) =>
       typeof txt === "string"
@@ -181,30 +191,40 @@ function mergeMultiTenant(responses /* [{tenant, json}] */) {
   return { records: allRecords, types, metadata, metrics };
 }
 
+// ---------- main ----------
 export default async function () {
-  // ===== Configure =====
-  const credentialId = "CREDENTIALS_VAULT-XXXXXXXX";
-  const query = "timeseries count(dt.host.cpu.user), from:-5m , by: { host.name } | limit 2";
+  // ==== configure ====
+  const credentialId = "CREDENTIALS_VAULT-XXXXXXXX"; // <-- your Credentials Vault ID
+  const query = "timeseries count(dt.host.cpu.user), from:-5m , by: { host.name } | limit 2"; // <-- your DQL
 
-  // Map of tenant name -> platform query endpoint
+  // tenant name -> query endpoint
   const tenantMap = {
     prod: "https://<tenantA>.apps.dynatrace.com/platform/storage/query/v1/query:execute",
     qa:   "https://<tenantB>.apps.dynatrace.com/platform/storage/query/v1/query:execute",
   };
 
-  // Choose tenants
   const selected = ($tenant && asArray($tenant)) || Object.keys(tenantMap);
   const targets = selected.map((name) => ({ tenant: name, url: tenantMap[name] })).filter((t) => t.url);
 
   if (!targets.length) throw new Error("No tenant URLs resolved.");
 
   try {
+    console.log("[Main] Tenants:", selected.join(", "));
     const fetched = await Promise.all(
-      targets.map(async ({ tenant, url }) => ({ tenant, json: await fetchFromDynatrace(credentialId, url, query) }))
+      targets.map(async ({ tenant, url }) => {
+        const json = await fetchFromDynatrace(credentialId, url, query);
+        console.log(`[Main] ${tenant}: result keys:`, Object.keys(json?.result || json || {}));
+        return { tenant, json };
+      })
     );
 
-    // Return merged DQL-shaped object with extra `tenant` column and fixed metadata
-    return mergeMultiTenant(fetched);
+    const result = mergeMultiTenant(fetched);
+    console.log("[Main] Final merged output:", JSON.stringify(result, null, 2));
+    // One and only one top-level metrics array; check quickly:
+    console.log("[Main] metrics length:", (result.metrics || []).length);
+    console.log("[Main] timezone:", result?.metadata?.grail?.timezone);
+
+    return result;
   } catch (e) {
     console.error("[MultiTenantError]", e?.message || e);
     return { records: [], types: [], metadata: {}, metrics: [] };
