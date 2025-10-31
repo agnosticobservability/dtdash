@@ -1,80 +1,93 @@
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
-// ========= helpers =========
-function asArray(v) { return Array.isArray(v) ? v : (v ? [v] : []); }
+/**
+ * Dynatrace Gen3 Dashboards – JS Code Tile
+ * Multi-tenant DQL executor & merger
+ *
+ * - Executes the same DQL against multiple tenants
+ * - Merges results preserving the original DQL schema
+ * - Injects an extra dimension/column: `tenant`
+ * - Builds `types` dynamically from the API response (no hard-coding)
+ * - Widens metadata.grail.analysisTimeframe to the global min/max
+ * - Keeps a single top-level `metrics` array
+ */
 
-function normalizeResult(json) {
-  // API may return { result: {...} } or plain {...}
-  const res = json?.result ?? json;
+// ----------------- utilities -----------------
+const asArray = (v) => (Array.isArray(v) ? v : v ? [v] : []);
+const deepClone = (obj) => JSON.parse(JSON.stringify(obj));
+const parseTs = (s) => (typeof s === "string" ? Date.parse(s) : Number(s));
+
+const normalize = (json) => {
+  const r = json?.result ?? json ?? {};
   return {
-    records: asArray(res?.records),
-    types: asArray(res?.types),
-    metadata: res?.metadata ?? json?.metadata ?? {},
-    metrics: asArray(res?.metrics ?? json?.metrics),
+    records: asArray(r.records),
+    types: asArray(r.types),
+    metadata: r.metadata ?? {},
+    metrics: asArray(r.metrics),
   };
-}
+};
 
-function parseTs(ts) {
-  // ts is ISO with or without TZ (e.g., "...-04:00" or "...Z")
-  // Date.parse returns ms; keep it numeric for min/max math
-  return typeof ts === "string" ? Date.parse(ts) : Number(ts);
-}
-
-function timeframeOfRecord(rec) {
-  const start = parseTs(rec?.timeframe?.start);
-  const end = parseTs(rec?.timeframe?.end);
-  return { start, end };
-}
-
-function widenAnalysisTimeframe(records, baseMeta) {
-  let minStart = Number.POSITIVE_INFINITY;
-  let maxEnd = Number.NEGATIVE_INFINITY;
-
-  for (const r of records) {
-    const { start, end } = timeframeOfRecord(r);
-    if (Number.isFinite(start)) minStart = Math.min(minStart, start);
-    if (Number.isFinite(end))   maxEnd   = Math.max(maxEnd, end);
+const globalTimeframe = (records, baseMeta) => {
+  let minS = Infinity,
+    maxE = -Infinity;
+  for (const rec of records) {
+    const s = parseTs(rec?.timeframe?.start);
+    const e = parseTs(rec?.timeframe?.end);
+    if (Number.isFinite(s)) minS = Math.min(minS, s);
+    if (Number.isFinite(e)) maxE = Math.max(maxE, e);
   }
-
-  const tf = (isFinite(minStart) && isFinite(maxEnd))
-    ? {
-        start: new Date(minStart).toISOString(),
-        end: new Date(maxEnd).toISOString(),
-      }
-    : (baseMeta?.grail?.analysisTimeframe ?? baseMeta?.analysisTimeframe);
-
+  const iso = (ms) => new Date(ms).toISOString();
+  const grail = baseMeta?.grail ?? {};
   return {
     ...baseMeta,
     grail: {
-      ...(baseMeta?.grail ?? {}),
-      analysisTimeframe: tf,
+      ...grail,
+      analysisTimeframe:
+        Number.isFinite(minS) && Number.isFinite(maxE)
+          ? { start: iso(minS), end: iso(maxE) }
+          : grail.analysisTimeframe,
     },
-    analysisTimeframe: undefined, // keep only under grail to mirror your sample
   };
+};
+
+// Fallback: infer minimal types[0] from one record (used only if API didn't return types)
+function inferTypesFromRecord(sample) {
+  const mappings = {};
+  for (const [k, v] of Object.entries(sample ?? {})) {
+    if (k === "timeframe" && v && typeof v === "object" && "start" in v && "end" in v) {
+      mappings[k] = { type: "timeframe" };
+    } else if (k === "interval" && (typeof v === "number" || /^\d+$/.test(String(v)))) {
+      mappings[k] = { type: "duration" };
+    } else if (Array.isArray(v)) {
+      const eltType = v.find((x) => x != null);
+      mappings[k] = {
+        type: "array",
+        types: [
+          {
+            indexRange: [0, Math.max(0, v.length - 1)],
+            mappings: { element: { type: typeof eltType === "number" ? "double" : "string" } },
+          },
+        ],
+      };
+    } else {
+      mappings[k] = { type: "string" };
+    }
+  }
+  return [{ indexRange: [0, 1], mappings }];
 }
 
+// ----------------- network -----------------
 async function fetchFromDynatrace(credentialId, url, query) {
-  if (!credentialId || !url || !query) {
-    throw new Error("[ValidationError] Missing required parameters: credentialId, url, or query.");
-  }
+  if (!credentialId || !url || !query) throw new Error("Missing credentialId, url, or query.");
 
-  let token;
-  try {
-    token = await credentialVaultClient
-      .getCredentialsDetails({ id: credentialId })
-      .then((res) => res?.token);
-  } catch (e) {
-    throw new Error("Unable to fetch platform token.");
-  }
-  if (!token) throw new Error("[CredentialVaultError] Token is undefined or empty.");
+  const token = await credentialVaultClient
+    .getCredentialsDetails({ id: credentialId })
+    .then((r) => r?.token);
+  if (!token) throw new Error("Empty platform token.");
 
-  const body = {
-    query,
-    requestTimeoutMilliseconds: 60000,
-    enablePreview: true,
-  };
+  const body = { query, requestTimeoutMilliseconds: 60000, enablePreview: true };
 
-  const response = await fetch(url, {
+  const res = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -83,117 +96,103 @@ async function fetchFromDynatrace(credentialId, url, query) {
     },
     body: JSON.stringify(body),
   });
-
-  if (!response.ok) {
-    throw new Error(`[HTTPError] API call failed with status ${response.status}: ${response.statusText}`);
-  }
-  return response.json();
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+  return res.json();
 }
 
-// ========= shape merger (adds tenant) =========
+// ----------------- merger: dynamic types + tenant -----------------
 function mergeMultiTenant(responses /* [{tenant, json}] */) {
-  if (!responses.length) {
-    return { records: [], types: [], metadata: {}, metrics: [] };
-  }
+  if (!responses.length) return { records: [], types: [], metadata: {}, metrics: [] };
 
-  // Normalize all
+  // Normalize and inject tenant column per record
   const normalized = responses.map(({ tenant, json }) => {
-    const n = normalizeResult(json);
-    // Inject tenant into each record
-    const recordsWithTenant = (n.records || []).map((r) => ({ ...r, tenant }));
-    return { tenant, ...n, records: recordsWithTenant };
+    const n = normalize(json);
+    const withTenant = n.records.map((r) => ({ ...r, tenant }));
+    return { tenant, records: withTenant, types: n.types, metadata: n.metadata, metrics: n.metrics };
   });
 
-  // Merge records
   const allRecords = normalized.flatMap((n) => n.records);
 
-  // Base types/metadata/metrics from first tenant
-  const base = normalized[0];
+  // Build types dynamically from the first response (or infer)
+  let types0;
+  const baseTypes0 = normalized[0].types?.[0];
+  if (baseTypes0) {
+    types0 = deepClone(baseTypes0);
+    types0.mappings = types0.mappings || {};
+  } else {
+    types0 = inferTypesFromRecord(allRecords[0])?.[0];
+  }
+  // Add tenant mapping only if missing
+  if (!types0.mappings.tenant) types0.mappings.tenant = { type: "string" };
+  const types = [types0];
 
-  // Clone types[0] and add tenant mapping
-  const baseTypes = asArray(base.types);
-  const t0 = baseTypes[0] ? JSON.parse(JSON.stringify(baseTypes[0])) : { indexRange: [0, 0], mappings: {} };
-  t0.mappings = t0.mappings || {};
-  t0.mappings.tenant = { type: "string" };
-
-  // Optionally update indexRange high bound to reflect number of "columns" present; keep your original as-is.
-  const mergedTypes = [t0];
-
-  // Merge metadata: keep first, widen timeframe; sum scannedDataPoints if present
-  const metaSumDataPoints = normalized.reduce(
+  // Metadata: widen timeframe and sum scannedDataPoints across tenants
+  const baseMeta = normalized[0].metadata || {};
+  const scannedSum = normalized.reduce(
     (acc, n) => acc + Number(n.metadata?.grail?.scannedDataPoints || 0),
     0
   );
-  const metadata = widenAnalysisTimeframe(allRecords, {
-    ...base.metadata,
+  const metadata = globalTimeframe(allRecords, {
+    ...baseMeta,
     grail: {
-      ...(base.metadata?.grail ?? {}),
-      scannedDataPoints: metaSumDataPoints || base.metadata?.grail?.scannedDataPoints,
+      ...(baseMeta.grail ?? {}),
+      scannedDataPoints: scannedSum || baseMeta.grail?.scannedDataPoints,
     },
   });
 
-  // Keep metrics from first (they’re identical across tenants for same query)
-  const metrics = base.metrics;
+  // Keep metrics from first response
+  const metrics = normalized[0].metrics;
 
-  return {
-    records: allRecords,
-    types: mergedTypes,
-    metadata,
-    metrics,
-  };
+  // Cosmetic: reflect tenant in query/by if present
+  if (metadata?.grail) {
+    const addTenantToBy = (txt) =>
+      typeof txt === "string"
+        ? txt.replace(/by:\s*\{\s*([^}]*)\s*\}/i, (_, g1) => {
+            const parts = g1
+              .split(",")
+              .map((s) => s.trim())
+              .filter(Boolean);
+            if (!parts.includes("tenant")) parts.push("tenant");
+            return `by:{${parts.join(", ")}}`;
+          })
+        : txt;
+    metadata.grail.canonicalQuery = addTenantToBy(metadata.grail.canonicalQuery);
+    metadata.grail.query = addTenantToBy(metadata.grail.query);
+  }
+
+  return { records: allRecords, types, metadata, metrics };
 }
 
-// ========= main =========
+// ----------------- main entry -----------------
 export default async function () {
-  // === YOUR SETTINGS ===
-  const credentialId = "CREDENTIALS_VAULT-XXXXXXXXXXXX?"; // <-- keep your real id
-  const query =
-    "timeseries count(dt.host.cpu.user), from:-5m , by: { host.name } | limit 2";
+  // ===== Configure your environment =====
+  const credentialId = "CREDENTIALS_VAULT-XXXXXXXX"; // TODO: replace with your Credentials Vault ID
+  const query = "timeseries count(dt.host.cpu.user), from:-5m , by: { host.name } | limit 2"; // TODO: set your DQL
 
-  // Map of tenant name -> query endpoint
+  // Map of tenant name -> platform query endpoint
   const tenantMap = {
-    prod: "https://xxx.apps.dynatrace.com/platform/storage/query/v1/query:execute",
-    dev: "https://yyy.apps.dynatrace.com/platform/storage/query/v1/query:execute",
-    // ...
+    prod: "https://<tenantA>.apps.dynatrace.com/platform/storage/query/v1/query:execute",
+    qa: "https://<tenantB>.apps.dynatrace.com/platform/storage/query/v1/query:execute",
+    // dev: "https://<tenantC>.apps.dynatrace.com/platform/storage/query/v1/query:execute",
   };
 
-  // Selected tenants (e.g., from dashboard variable)
-  const selectedTenantsDashboard = $tenant || Object.keys(tenantMap);
-  const urls = asArray(selectedTenantsDashboard)
+  // Choose tenants
+  const selected = ($tenant && asArray($tenant)) || Object.keys(tenantMap);
+  const targets = selected
     .map((name) => ({ tenant: name, url: tenantMap[name] }))
-    .filter((t) => !!t.url);
+    .filter((t) => t.url);
 
-  if (!urls.length) throw new Error("No tenant URLs resolved. Check tenant map / selection.");
+  if (!targets.length) throw new Error("No tenant URLs resolved.");
 
   try {
-    const responses = await Promise.all(
-      urls.map(async ({ tenant, url }) => {
-        const json = await fetchFromDynatrace(credentialId, url, query);
-        return { tenant, json };
-      })
+    const fetched = await Promise.all(
+      targets.map(async ({ tenant, url }) => ({ tenant, json: await fetchFromDynatrace(credentialId, url, query) }))
     );
 
-    // Build merged, DQL-shaped structure with extra "tenant" column
-    const merged = mergeMultiTenant(responses);
-
-    // Optional: tweak metadata.grail.canonicalQuery to document tenant dimension
-    // (purely cosmetic; remove if you want original verbatim)
-    const q = (merged?.metadata?.grail?.query || query);
-    merged.metadata.grail = {
-      ...(merged.metadata.grail || {}),
-      canonicalQuery: (merged.metadata.grail?.canonicalQuery || q).replace(
-        /by:\s*\{([^}]*)\}/,
-        (m, g1) => `by:{${g1.trim().length ? g1.trim() + ", tenant" : "tenant"}}`
-      ),
-      query: q.replace(
-        /by:\s*\{([^}]*)\}/,
-        (m, g1) => `by: { ${g1.trim().length ? g1.trim() + ", tenant" : "tenant"} }`
-      ),
-    };
-
-    return merged;
-  } catch (error) {
-    console.error(`[MainFunctionError] ${error.message}`);
+    // Return merged DQL-shaped object with extra `tenant` column
+    return mergeMultiTenant(fetched);
+  } catch (e) {
+    console.error("[MultiTenantError]", e?.message || e);
     return { records: [], types: [], metadata: {}, metrics: [] };
   }
 }
